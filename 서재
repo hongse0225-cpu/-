@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>서재 - 소설 텍스트 백업</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase SDK v9 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
+        import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, getDoc, getDocs, deleteDoc, query, orderBy } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js";
+
+        // Firebase 설정 (사용자 프로젝트 환경에 맞게 입력하거나 테스트용 기본값 사용)
+        const firebaseConfig = {
+            apiKey: "AIzaSyD-Placeholder-KeyForDemo...",
+            authDomain: "seojae-vault.firebaseapp.com",
+            projectId: "seojae-vault",
+            storageBucket: "seojae-vault.appspot.com",
+            messagingSenderId: "123456789012",
+            appId: "1:123456789012:web:abcdef123456"
+        };
+
+        let app, auth, db;
+        let currentUser = null;
+        let currentNovelId = null;
+        let novels = [];
+        let autoSaveTimer = null;
+        const CHUNK_SIZE = 200000; // 20만 자 단위 청크 분할
+
+        try {
+            app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+        } catch (e) {
+            console.warn("Firebase initialized in offline/placeholder mode", e);
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            setupAuthListeners();
+            setupAppListeners();
+            registerServiceWorker();
+        });
+
+        function setupAuthListeners() {
+            const loginForm = document.getElementById('loginForm');
+            const toggleModeBtn = document.getElementById('toggleModeBtn');
+            const authTitle = document.getElementById('authTitle');
+            const submitBtn = document.getElementById('authSubmitBtn');
+            let isSignUp = false;
+
+            toggleModeBtn.addEventListener('click', () => {
+                isSignUp = !isSignUp;
+                authTitle.textContent = isSignUp ? '서재 회원가입' : '서재 로그인';
+                submitBtn.textContent = isSignUp ? '가입하기' : '로그인';
+                toggleModeBtn.textContent = isSignUp ? '이미 계정이 있으신가요? 로그인' : '계정이 없으신가요? 회원가입';
+            });
+
+            loginForm.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                if (!auth) {
+                    alert("Firebase 설정이 올바르지 않습니다. 소스코드의 firebaseConfig를 확인해주세요.");
+                    return;
+                }
+                const email = document.getElementById('authEmail').value;
+                const password = document.getElementById('authPassword').value;
+                const errorBox = document.getElementById('authError');
+                errorBox.classList.add('hidden');
+
+                try {
+                    if (isSignUp) {
+                        await createUserWithEmailAndPassword(auth, email, password);
+                    } else {
+                        await signInWithEmailAndPassword(auth, email, password);
+                    }
+                } catch (err) {
+                    errorBox.textContent = "오류: " + err.message;
+                    errorBox.classList.remove('hidden');
+                }
+            });
+
+            if (auth) {
+                onAuthStateChanged(auth, (user) => {
+                    currentUser = user;
+                    const authGate = document.getElementById('authGateScreen');
+                    const mainApp = document.getElementById('mainAppContainer');
+
+                    if (user) {
+                        authGate.classList.add('hidden');
+                        mainApp.classList.remove('hidden');
+                        document.getElementById('userEmailDisplay').textContent = user.email;
+                        loadUserData();
+                    } else {
+                        authGate.classList.remove('hidden');
+                        mainApp.classList.add('hidden');
+                        novels = [];
+                    }
+                });
+            }
+
+            document.getElementById('logoutBtn').addEventListener('click', async () => {
+                if (auth) await signOut(auth);
+            });
+        }
+
+        async function loadUserData() {
+            if (!currentUser || !db) return;
+            try {
+                const q = query(collection(db, `users/${currentUser.uid}/novels`), orderBy('updatedAt', 'desc'));
+                const querySnapshot = await getDocs(q);
+                novels = [];
+                for (let d of querySnapshot.docs) {
+                    const data = d.data();
+                    let content = data.content || "";
+                    if (data.chunkCount && data.chunkCount > 1) {
+                        content = "";
+                        for (let i = 0; i < data.chunkCount; i++) {
+                            const chunkDoc = await getDoc(doc(db, `users/${currentUser.uid}/novels/${d.id}/chunks`, `chunk_${i}`));
+                            if (chunkDoc.exists()) content += chunkDoc.data().text;
+                        }
+                    }
+                    novels.push({ id: d.id, title: data.title, content: content, snapshots: data.snapshots || [], updatedAt: data.updatedAt });
+                }
+                renderNovelList();
+                if (novels.length > 0) {
+                    selectNovel(novels[0].id);
+                } else {
+                    createNewNovel("첫 번째 소설");
+                }
+            } catch (e) {
+                console.error("데이터 로드 실패", e);
+            }
+        }
+
+        async function saveCurrentNovelToCloud() {
+            if (!currentUser || !db || !currentNovelId) return;
+            const novel = novels.find(n => n.id === currentNovelId);
+            if (!novel) return;
+
+            novel.updatedAt = new Date().toISOString();
+            const text = novel.content;
+            const chunkCount = Math.ceil(text.length / CHUNK_SIZE) || 1;
+
+            document.getElementById('syncStatus').textContent = "저장 중...";
+
+            try {
+                for (let i = 0; i < chunkCount; i++) {
+                    const chunkText = text.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                    await setDoc(doc(db, `users/${currentUser.uid}/novels/${novel.id}/chunks`, `chunk_${i}`), { text: chunkText });
+                }
+                await setDoc(doc(db, `users/${currentUser.uid}/novels/${novel.id}`), {
+                    title: novel.title,
+                    updatedAt: novel.updatedAt,
+                    chunkCount: chunkCount,
+                    snapshots: novel.snapshots || []
+                });
+                document.getElementById('syncStatus').textContent = "저장됨";
+                setTimeout(() => { document.getElementById('syncStatus').textContent = ""; }, 2000);
+            } catch (e) {
+                console.error("저장 실패", e);
+                document.getElementById('syncStatus').textContent = "저장 실패";
+            }
+        }
+
+        function setupAppListeners() {
+            const editor = document.getElementById('novelEditor');
+            const titleInput = document.getElementById('novelTitle');
+
+            editor.addEventListener('input', () => {
+                const novel = novels.find(n => n.id === currentNovelId);
+                if (!novel) return;
+                novel.content = editor.value;
+                updateStats();
+                
+                clearTimeout(autoSaveTimer);
+                autoSaveTimer = setTimeout(() => {
+                    saveCurrentNovelToCloud();
+                }, 1000);
+            });
+
+            titleInput.addEventListener('input', () => {
+                const novel = novels.find(n => n.id === currentNovelId);
+                if (!novel) return;
+                novel.title = titleInput.value;
+                renderNovelList();
+                
+                clearTimeout(autoSaveTimer);
+                autoSaveTimer = setTimeout(() => {
+                    saveCurrentNovelToCloud();
+                }, 1000);
+            });
+
+            document.getElementById('newNovelBtn').addEventListener('click', () => {
+                createNewNovel("새로운 소설");
+            });
+
+            document.getElementById('snapshotBtn').addEventListener('click', () => {
+                const novel = novels.find(n => n.id === currentNovelId);
+                if (!novel) return;
+                const memo = prompt("백업 메모를 입력하세요 (예: 1화 탈고)", `백업 ${new Date().toLocaleString()}`);
+                if (memo === null) return;
+                if (!novel.snapshots) novel.snapshots = [];
+                novel.snapshots.unshift({ id: Date.now(), memo: memo, content: novel.content, date: new Date().toLocaleString() });
+                saveCurrentNovelToCloud();
+                renderSnapshots();
+                alert("현재 원고가 스냅샷으로 백업되었습니다.");
+            });
+
+            document.getElementById('exportTxtBtn').addEventListener('click', () => {
+                const novel = novels.find(n => n.id === currentNovelId);
+                if (!novel) return;
+                const blob = new Blob([novel.content], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${novel.title || '소설'}.txt`;
+                a.click();
+                URL.revokeObjectURL(url);
+            });
+        }
+
+        function createNewNovel(title) {
+            const newN = {
+                id: 'novel_' + Date.now(),
+                title: title,
+                content: '',
+                snapshots: [],
+                updatedAt: new Date().toISOString()
+            };
+            novels.unshift(newN);
+            selectNovel(newN.id);
+            renderNovelList();
+            saveCurrentNovelToCloud();
+        }
+
+        function selectNovel(id) {
+            currentNovelId = id;
+            const novel = novels.find(n => n.id === id);
+            if (!novel) return;
+            document.getElementById('novelTitle').value = novel.title;
+            document.getElementById('novelEditor').value = novel.content;
+            updateStats();
+            renderNovelList();
+            renderSnapshots();
+        }
+
+        function renderNovelList() {
+            const list = document.getElementById('novelList');
+            list.innerHTML = '';
+            novels.forEach(n => {
+                const div = document.createElement('div');
+                div.className = `p-3 border-b cursor-pointer transition ${n.id === currentNovelId ? 'bg-zinc-100 font-semibold' : 'hover:bg-zinc-50'}`;
+                div.textContent = n.title || '제목 없음';
+                div.onclick = () => selectNovel(n.id);
+                list.appendChild(div);
+            });
+        }
+
+        function updateStats() {
+            const text = document.getElementById('novelEditor').value;
+            const lenWithSpace = text.length;
+            const lenWithoutSpace = text.replace(/\s/g, '').length;
+
+            document.getElementById('charCountSpace').textContent = lenWithSpace.toLocaleString();
+            document.getElementById('charCountNoSpace').textContent = lenWithoutSpace.toLocaleString();
+
+            const minTarget = 10000;
+            const maxLimit = 1000000;
+            const percent = Math.min(100, Math.max(0, (lenWithSpace / maxLimit) * 100));
+            
+            document.getElementById('progressBar').style.width = percent + '%';
+            
+            const badge = document.getElementById('minTargetBadge');
+            if (lenWithSpace >= minTarget) {
+                badge.textContent = "최소 분량(1만자) 달성";
+                badge.className = "text-xs px-2 py-0.5 bg-emerald-100 text-emerald-800";
+            } else {
+                badge.textContent = `최소 분량까지 ${(minTarget - lenWithSpace).toLocaleString()}자 남음`;
+                badge.className = "text-xs px-2 py-0.5 bg-amber-100 text-amber-800";
+            }
+        }
+
+        function renderSnapshots() {
+            const container = document.getElementById('snapshotList');
+            container.innerHTML = '';
+            const novel = novels.find(n => n.id === currentNovelId);
+            if (!novel || !novel.snapshots || novel.snapshots.length === 0) {
+                container.innerHTML = '<div class="text-xs text-zinc-400 p-2">저장된 스냅샷이 없습니다.</div>';
+                return;
+            }
+            novel.snapshots.forEach(s => {
+                const item = document.createElement('div');
+                item.className = 'p-2 border-b text-xs flex justify-between items-center';
+                item.innerHTML = `<div><div class="font-medium">${s.memo}</div><div class="text-zinc-400">${s.date}</div></div>`;
+                const restoreBtn = document.createElement('button');
+                restoreBtn.className = 'text-blue-600 hover:underline px-2 py-1';
+                restoreBtn.textContent = '복원';
+                restoreBtn.onclick = () => {
+                    if (confirm(`"${s.memo}" 시점으로 원고를 복원하시겠습니까?`)) {
+                        novel.content = s.content;
+                        document.getElementById('novelEditor').value = novel.content;
+                        updateStats();
+                        saveCurrentNovelToCloud();
+                        alert("복원되었습니다.");
+                    }
+                };
+                item.appendChild(restoreBtn);
+                container.appendChild(item);
+            });
+        }
+
+        function registerServiceWorker() {
+            if ('serviceWorker' in navigator) {
+                const swCode = `self.addEventListener('fetch', function(event) {});`;
+                const blob = new Blob([swCode], { type: 'text/javascript' });
+                navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(err => console.log(err));
+            }
+        }
+    </script>
+</head>
+<body class="bg-white text-zinc-900 font-sans antialiased">
+
+    <!-- 1. 진입 시 필수 로그인 잠금 화면 (정가운데 이메일/비번 입력) -->
+    <div id="authGateScreen" class="fixed inset-0 bg-white z-50 flex items-center justify-center p-4">
+        <div class="w-full max-w-sm p-8 border border-zinc-200">
+            <h1 id="authTitle" class="text-xl font-bold tracking-tight mb-6 text-center">서재 로그인</h1>
+            
+            <div id="authError" class="hidden mb-4 p-3 bg-red-50 text-red-700 text-xs border border-red-200"></div>
+
+            <form id="loginForm" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-medium text-zinc-600 mb-1">구글 이메일</label>
+                    <input type="email" id="authEmail" required class="w-full px-3 py-2 border border-zinc-300 text-sm focus:outline-none focus:border-zinc-900">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-zinc-600 mb-1">비밀번호</label>
+                    <input type="password" id="authPassword" required class="w-full px-3 py-2 border border-zinc-300 text-sm focus:outline-none focus:border-zinc-900">
+                </div>
+                <button type="submit" id="authSubmitBtn" class="w-full py-2.5 bg-zinc-900 text-white text-sm font-medium hover:bg-zinc-800 transition">로그인</button>
+            </form>
+
+            <div class="mt-4 text-center">
+                <button id="toggleModeBtn" class="text-xs text-zinc-500 hover:underline">계정이 없으신가요? 회원가입</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 2. 로그인 후 메인 앱 컨테이너 -->
+    <div id="mainAppContainer" class="hidden min-h-screen flex flex-col">
+        <!-- 상단 헤더 -->
+        <header class="border-b border-zinc-200 px-6 py-4 flex justify-between items-center">
+            <div class="flex items-center space-x-4">
+                <span class="font-bold text-lg tracking-tight">서재</span>
+                <span id="userEmailDisplay" class="text-xs text-zinc-500"></span>
+            </div>
+            <div class="flex items-center space-x-3">
+                <span id="syncStatus" class="text-xs text-zinc-400"></span>
+                <button id="logoutBtn" class="text-xs px-3 py-1.5 border border-zinc-300 hover:bg-zinc-50 transition">로그아웃</button>
+            </div>
+        </header>
+
+        <!-- 메인 작업 영역 -->
+        <div class="flex-1 flex flex-col md:flex-row">
+            <!-- 좌측 작품 목록 -->
+            <div class="w-full md:w-64 border-r border-zinc-200 p-4 bg-zinc-50 flex flex-col">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold tracking-wider uppercase text-zinc-500">작품 목록</span>
+                    <button id="newNovelBtn" class="text-xs px-2 py-1 bg-zinc-900 text-white hover:bg-zinc-800">+ 새 소설</button>
+                </div>
+                <div id="novelList" class="flex-1 overflow-y-auto space-y-1 mb-4"></div>
+                
+                <div class="border-t border-zinc-200 pt-3">
+                    <span class="text-xs font-semibold tracking-wider uppercase text-zinc-500 mb-2 block">스냅샷 백업</span>
+                    <button id="snapshotBtn" class="w-full mb-2 py-1.5 text-xs border border-zinc-300 hover:bg-zinc-100 transition">현재 시점 박제하기</button>
+                    <div id="snapshotList" class="max-h-40 overflow-y-auto space-y-1"></div>
+                </div>
+            </div>
+
+            <!-- 우측 에디터 영역 -->
+            <div class="flex-1 flex flex-col p-6 max-w-5xl mx-auto w-full">
+                <div class="flex justify-between items-center mb-4">
+                    <input type="text" id="novelTitle" placeholder="소설 제목을 입력하세요" class="text-xl font-bold border-b border-transparent hover:border-zinc-300 focus:border-zinc-900 focus:outline-none pb-1 flex-1 mr-4">
+                    <div class="flex space-x-2">
+                        <button id="exportTxtBtn" class="px-3 py-1.5 text-xs border border-zinc-300 hover:bg-zinc-50 transition">TXT 다운로드</button>
+                    </div>
+                </div>
+
+                <!-- 통계 및 게이지 바 -->
+                <div class="bg-zinc-50 border border-zinc-200 p-3 mb-4 text-xs space-y-2">
+                    <div class="flex justify-between items-center">
+                        <div class="space-x-3">
+                            <span>공백 포함: <strong id="charCountSpace" class="font-semibold">0</strong>자</span>
+                            <span>공백 제외: <strong id="charCountNoSpace" class="font-semibold">0</strong>자</span>
+                        </div>
+                        <span id="minTargetBadge" class="text-xs px-2 py-0.5 bg-amber-100 text-amber-800">최소 분량까지 10,000자 남음</span>
+                    </div>
+                    <div class="w-full bg-zinc-200 h-1.5 overflow-hidden">
+                        <div id="progressBar" class="bg-zinc-900 h-full w-0 transition-all duration-300"></div>
+                    </div>
+                    <div class="text-[10px] text-zinc-400 flex justify-between">
+                        <span>최소 권장: 1만 자</span>
+                        <span>최대 용량: 100만 자</span>
+                    </div>
+                </div>
+
+                <!-- 본문 에디터 -->
+                <textarea id="novelEditor" placeholder="여기에 소설 본문을 작성하세요. (최대 100만 자까지 안정적으로 백업됩니다)" class="flex-1 w-full p-4 border border-zinc-200 focus:outline-none focus:border-zinc-900 resize-none font-serif leading-relaxed text-base min-h-[500px]"></textarea>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
